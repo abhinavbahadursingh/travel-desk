@@ -479,3 +479,4 @@ Authentication/SSO (identity is the local `DEV_USER_EMAIL` mechanism), in-app pr
 (Duffel, Amadeus, Uber for Business), Teams adapter, expense capture, multi-tenant isolation,
 distributed rate limiting, background notification delivery, and pagination on large tables.
 # travel-desk
+# travel-desk
