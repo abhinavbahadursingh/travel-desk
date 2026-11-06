@@ -1,0 +1,391 @@
+// PostgreSQL variant of prisma/schema.prisma — model definitions are
+// kept identical. Only the datasource provider differs.
+//
+// Used by:
+//   npm run db:pg:push      (prisma db push against Postgres)
+//   npm run db:pg:migrate   (prisma migrate dev against Postgres)
+//   npm run db:pg:migrate:deploy
+//   npm run db:migrate:from-sqlite
+//
+// Keep the model block in sync with prisma/schema.prisma — the
+// SYNC-GUARD test (tests/integration/schema-sync.test.ts) verifies that
+// the two files have identical model/enum bodies and will fail CI if
+// they drift.
+// The Postgres client is generated to a separate output path so the
+// migration utility can import both SQLite and Postgres clients from
+// one Node process. In production the app can reuse this same client by
+// importing `@prisma/client-postgres` (see lib/db.ts for selection).
+generator client {
+  provider = "prisma-client-js"
+  output   = "../node_modules/@prisma/client-postgres"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+
+// Roles: "employee" | "manager" | "travel_admin" | "super_admin".
+// Accounts are never deleted by the application; deactivate them instead so
+// trip, approval and booking history stays intact.
+model User {
+  id                    String                @id @default(cuid())
+  email                 String                @unique
+  name                  String
+  role                  String                @default("employee")
+  active                Boolean               @default(true)
+  department            String?
+  managerId             String?
+  manager               User?                 @relation("ManagerReports", fields: [managerId], references: [id], onDelete: SetNull)
+  reports               User[]                @relation("ManagerReports")
+  slackUserId           String?               @unique
+
+  // Issue 3 — real authentication. Additive columns. Existing users keep
+  // `mustSetPassword = true` until they activate their account.
+  passwordHash          String?
+  passwordSalt          String?
+  mustSetPassword       Boolean               @default(true)
+  failedLoginAttempts   Int                   @default(0)
+  lockedUntil           DateTime?
+  lastLoginAt           DateTime?
+  lastPasswordChange    DateTime?
+  activationToken       String?               @unique
+  activationExpiresAt   DateTime?
+
+  // ---- Personal information (additive, optional) ----
+  phone                 String?
+  alternatePhone        String?
+  personalEmail         String?
+  dateOfBirth           DateTime?
+  gender                String?
+  address               String?
+  city                  String?
+  state                 String?
+  country               String?
+  pinCode               String?
+  profilePicture        String?
+
+  // ---- Professional information (additive, optional) ----
+  employeeId            String?               @unique
+  jobTitle              String?
+  designation           String?
+  employmentType        String?
+  joiningDate           DateTime?
+  officeLocation        String?
+  businessUnit          String?
+  costCentre            String?
+  workLocation          String?
+
+  travelPreference      TravelPreference?
+
+  requests              TripRequest[]         @relation("Requester")
+  approvals             Approval[]            @relation("Approver")
+  assignedApprovals     Approval[]            @relation("ApprovalAssignedBy")
+  approvalEvents        ApprovalEvent[]       @relation("ApprovalEventActor")
+  confirmedBookings     Booking[]             @relation("ConfirmedBy")
+  cancellationRequests  CancellationRequest[] @relation("CancellationRequester")
+  reviewedCancellations CancellationRequest[] @relation("CancellationReviewer")
+  notifications         Notification[]
+  auditLogs             AuditLog[]            @relation("AuditActor")
+  sessions              Session[]
+  createdAt             DateTime              @default(now())
+  updatedAt             DateTime              @default(now()) @updatedAt
+
+  @@index([role, active])
+  @@index([managerId])
+  @@index([department])
+  @@index([employeeId])
+}
+
+// Travel preferences and emergency contact details for each employee.
+// One-to-one with User. Passport details are treated as sensitive — only
+// super admins can read/write them via the admin user endpoints.
+model TravelPreference {
+  id                        String   @id @default(cuid())
+  userId                    String   @unique
+  user                      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Travel preferences
+  preferredSeat             String?
+  preferredMeal             String?
+  preferredAirline          String?
+  preferredHotelCategory    String?
+  preferredHotelChain       String?
+  preferredTravelClass      String?
+
+  // Loyalty / identifiers (optional)
+  frequentFlyerNumbers      String?
+  hotelLoyaltyMembership    String?
+
+  // Sensitive — restricted access
+  passportDetails           String?
+  emergencyContactName      String?
+  emergencyContactNumber    String?
+  emergencyContactRelationship String?
+
+  createdAt                 DateTime @default(now())
+  updatedAt                 DateTime @updatedAt
+
+  @@index([userId])
+}
+
+// Server-side sessions. The cookie carries `<sessionId>.<rawToken>`. We store
+// only sha256(rawToken) so a leaked DB row cannot be used to forge a session.
+// Rotating a session (logout, password change) revokes by setting `revokedAt`.
+model Session {
+  id         String    @id @default(cuid())
+  userId     String
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash  String    @unique
+  csrfToken  String
+  ipAddress  String?
+  userAgent  String?
+  createdAt  DateTime  @default(now())
+  expiresAt  DateTime
+  revokedAt  DateTime?
+  lastSeenAt DateTime  @default(now())
+
+  @@index([userId, revokedAt])
+  @@index([expiresAt])
+}
+
+model TripRequest {
+  id                   String                @id @default(cuid())
+  requesterId          String
+  requester            User                  @relation("Requester", fields: [requesterId], references: [id], onDelete: Restrict)
+  purpose              String
+  origin               String
+  destination          String
+  originAirportCode      String?
+  originAirportName      String?
+  originCity             String?
+  originCountry          String?
+  originLatitude         Float?
+  originLongitude        Float?
+  destinationAirportCode String?
+  destinationAirportName String?
+  destinationCity        String?
+  destinationCountry     String?
+  destinationLatitude    Float?
+  destinationLongitude   Float?
+  departDate           DateTime
+  returnDate           DateTime? // null = one-way trip
+  // Cabin/class per mode of transport. `cabin` is kept in sync with
+  // `flightClass` so older code paths (policy evaluation, comparison, chat)
+  // keep working; new UI reads flightClass/trainClass directly.
+  cabin                String                @default("economy")
+  flightClass          String                @default("economy")
+  trainClass           String                @default("economy")
+  // "draft" | "pending_approval" | "approved" | "rejected"
+  //   | "booking_links_generated" | "booking_pending_confirmation"
+  //   | "booked" | "cancellation_requested" | "cancelled"
+  status               String                @default("draft")
+  currency             String                @default("USD") // "INR" for domestic India, else "USD"
+  // Null when the total is unknown (any featured leg had no listed price).
+  // Historical rows stored 0 with estimateIsComplete=false; those are preserved
+  // and interpreted as unknown via estimateIsComplete.
+  estimatedCost        Float?                // sum of featured legs that had a listed price; null = unknown
+  estimateIsComplete   Boolean               @default(false) // false if any featured leg had no listed price
+  policyFlags          String                @default("[]") // JSON array of flag strings
+  itinerary            String? // JSON blob of candidates by category with sources + timestamps
+  itineraryRetrievedAt DateTime?
+  // Phase 7 — interactive travel selection wizard. JSON blob holding the
+  // user's selected transport/hotel/cab/additional-expense picks and the
+  // computed breakdown (currency, perLeg totals, grandTotal). `confirmed`
+  // inside this blob distinguishes draft from confirmed. Nullable so
+  // existing rows keep rendering exactly as before.
+  selections           String?
+  selectionsUpdatedAt  DateTime?
+  notes                String?
+  submittedAt          DateTime?
+  decidedAt            DateTime?
+  bookedAt             DateTime?
+  cancelledAt          DateTime?
+  approvals            Approval[]
+  bookings             Booking[]
+  cancellationRequests CancellationRequest[]
+  createdAt            DateTime              @default(now())
+  updatedAt            DateTime              @updatedAt
+
+  @@index([requesterId, createdAt])
+  @@index([status, createdAt])
+}
+
+// One row per approval assignment. `pendingKey` is the trip id while the
+// approval is pending and NULL once decided, giving SQLite a unique partial
+// guarantee that a trip cannot have two pending approvals. Rejections keep
+// their row (and events) so history is never overwritten.
+model Approval {
+  id              String          @id @default(cuid())
+  tripRequestId   String
+  tripRequest     TripRequest     @relation(fields: [tripRequestId], references: [id], onDelete: Restrict)
+  approverId      String
+  approver        User            @relation("Approver", fields: [approverId], references: [id], onDelete: Restrict)
+  decision        String          @default("pending") // "pending" | "approved" | "rejected" | "changes_requested"
+  comment         String?
+  rejectionReason String?
+  pendingKey      String?         @unique
+  assignedById    String?
+  assignedBy      User?           @relation("ApprovalAssignedBy", fields: [assignedById], references: [id], onDelete: SetNull)
+  assignedAt      DateTime        @default(now())
+  decidedAt       DateTime?
+  // True for historical self-approvals (approver was the trip requester) that
+  // predate independent-approver enforcement. They are preserved as history and
+  // cannot be re-decided as valid approvals.
+  isLegacy        Boolean         @default(false)
+  createdAt       DateTime        @default(now())
+  events          ApprovalEvent[]
+
+  @@index([tripRequestId])
+  @@index([approverId, decision])
+}
+
+model ApprovalEvent {
+  id         String   @id @default(cuid())
+  approvalId String
+  approval   Approval @relation(fields: [approvalId], references: [id], onDelete: Cascade)
+  // "created" | "reassigned" | "comment" | "approved" | "rejected" | "changes_requested"
+  type       String
+  actorId    String?
+  actor      User?    @relation("ApprovalEventActor", fields: [actorId], references: [id], onDelete: SetNull)
+  comment    String?
+  metadata   String? // JSON, e.g. previousApproverId
+  createdAt  DateTime @default(now())
+
+  @@index([approvalId, createdAt])
+}
+
+// A Booking row NEVER represents a transaction performed by this app.
+// It represents a booking link we surfaced to the user, plus (optionally)
+// a manual confirmation recorded by a travel admin after they booked
+// externally. status transitions: "link_only" → "manually_confirmed" → "cancelled".
+model Booking {
+  id                    String      @id @default(cuid())
+  tripRequestId         String
+  tripRequest           TripRequest @relation(fields: [tripRequestId], references: [id], onDelete: Restrict)
+  kind                  String // "flight" | "hotel" | "train" | "cab"
+  vendor                String // display name of the provider
+  url                   String // deep link to the provider
+  source                String // hostname (duplicated here for easy query)
+  estimatedCost         Float? // parsed from search snippet; null if unknown
+  currency              String?
+  retrievedAt           DateTime // when the link was pulled
+  status                String      @default("link_only") // "link_only" | "manually_confirmed" | "cancelled"
+  reference             String? // external confirmation code, when manually confirmed
+  confirmedAt           DateTime?
+  confirmedById         String?
+  confirmedBy           User?       @relation("ConfirmedBy", fields: [confirmedById], references: [id], onDelete: SetNull)
+  cancelledAt           DateTime?
+  cancellationReference String?
+  details               String? // JSON — full candidate blob for provenance
+  createdAt             DateTime    @default(now())
+
+  @@index([tripRequestId, status])
+}
+
+model CancellationRequest {
+  id                    String      @id @default(cuid())
+  tripRequestId         String
+  tripRequest           TripRequest @relation(fields: [tripRequestId], references: [id], onDelete: Restrict)
+  requestedById         String
+  requestedBy           User        @relation("CancellationRequester", fields: [requestedById], references: [id], onDelete: Restrict)
+  reason                String
+  // "pending" | "rejected" | "completed"
+  status                String      @default("pending")
+  pendingKey            String?     @unique // trip id while pending
+  reviewNote            String?
+  cancellationReference String?
+  reviewedById          String?
+  reviewedBy            User?       @relation("CancellationReviewer", fields: [reviewedById], references: [id], onDelete: SetNull)
+  reviewedAt            DateTime?
+  createdAt             DateTime    @default(now())
+
+  @@index([tripRequestId, status])
+}
+
+model Notification {
+  id        String    @id @default(cuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type      String
+  title     String
+  body      String?
+  link      String?
+  readAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId, readAt])
+  @@index([createdAt])
+}
+
+// Transactional outbox for external notification delivery. Rows are inserted
+// INSIDE the same transaction as the business change (and the in-app
+// Notification row), so there is no partial state: once the transaction
+// commits, there is a durable record of what to send. A separate processor
+// picks pending rows, dispatches to the configured provider (Resend for
+// email, Slack webhook / chat.postMessage for Slack), and updates `status`
+// with `sentAt` on success or `attempts` + `lastError` on failure. Retries
+// are safe because `dedupeKey` is unique — a crash mid-send cannot create a
+// duplicate on the next sweep.
+model NotificationDelivery {
+  id             String    @id @default(cuid())
+  channel        String // "email" | "slack"
+  recipientUserId String
+  recipientAddress String? // email address or slack user/channel id cached at enqueue time
+  eventType      String // mirrors Notification.type
+  subject        String
+  body           String
+  link           String?
+  // Unique: (eventType, entityType, entityId, recipientUserId, channel)
+  // guarantees idempotency across retries AND across re-emits for the same
+  // event — if the business logic ever double-fires, the DB rejects the
+  // duplicate and we don't send twice.
+  dedupeKey      String   @unique
+  entityType     String?
+  entityId       String?
+  status         String   @default("pending") // "pending" | "sent" | "failed"
+  attempts       Int      @default(0)
+  lastError      String?
+  lastAttemptAt  DateTime?
+  sentAt         DateTime?
+  providerMessageId String?
+  createdAt      DateTime  @default(now())
+
+  @@index([status, createdAt])
+  @@index([recipientUserId])
+}
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  actorId    String?
+  actor      User?    @relation("AuditActor", fields: [actorId], references: [id], onDelete: SetNull)
+  action     String
+  entityType String
+  entityId   String?
+  summary    String
+  metadata   String?
+  createdAt  DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([actorId])
+  @@index([entityType, entityId])
+}
+
+model TravelPolicy {
+  id                                 String   @id @default(cuid())
+  name                               String   @unique
+  currency                           String   @default("INR")
+  maxFlightEconomy                   Float
+  maxHotelPerNight                   Float
+  maxTotalPerTrip                    Float
+  requireApprovalAbove               Float
+  advancePurchaseDays                Int
+  allowedCabins                      String   @default("[\"economy\",\"premium_economy\"]")
+  // Managers, travel admins and super admins may auto-approve within policy.
+  // Employees never auto-approve.
+  allowAutoApprovalForNonEmployees   Boolean  @default(true)
+  requireBookingReference            Boolean  @default(true)
+  cancellationRequiresAdminReview    Boolean  @default(true)
+  updatedAt                          DateTime @default(now()) @updatedAt
+}
